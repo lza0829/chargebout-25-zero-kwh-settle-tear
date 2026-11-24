@@ -120,11 +120,29 @@ MIGRATIONS = (
     ("sessions", "settle_kind", "TEXT"),
 )
 
-# 老回填：此前静默关成的零电量会话要补出同源标记，否则总览桶会把它漏成「正常」。
-BACKFILLS = (
-    "UPDATE sessions SET is_zero_kwh=1 WHERE status='已关账' AND COALESCE(kwh,0)<0.0005",
-    "UPDATE sessions SET settle_kind=CASE WHEN is_zero_kwh=1 THEN '零电量' ELSE '正常' END "
-    "WHERE status='已关账' AND settle_kind IS NULL",
+# 老回填/修复：所有会话的累计列以脉冲流水求和为唯一来源重放，修掉旁路把
+# kwh 抹零却留着脉冲行的假零电；已关账会话再按重放结果重建金额与零电标记，
+# 并删除非零会话上的假「零电量关账」审计、清掉旁路总览假计数。全部幂等。
+REPAIRS = (
+    # 1) 累计列 = 脉冲流水求和（开充默认 0，无流水即 0，可重放）。
+    """UPDATE sessions
+       SET kwh=(SELECT ROUND(COALESCE(SUM(delta_kwh),0),3) FROM pulses
+                WHERE pulses.session_id=sessions.id)""",
+    # 2) 已关账：金额、零电标记、关账类型全部按重放后的累计与锁定电价重建。
+    """UPDATE sessions
+       SET amount=CASE WHEN ROUND(COALESCE(kwh,0),3)<=0 THEN 0
+                       ELSE ROUND(kwh*COALESCE(price_locked,0),2) END,
+           is_zero_kwh=CASE WHEN ROUND(COALESCE(kwh,0),3)<=0 THEN 1 ELSE 0 END,
+           settle_kind=CASE WHEN ROUND(COALESCE(kwh,0),3)<=0 THEN '零电量' ELSE '正常' END
+       WHERE status='已关账'""",
+    # 3) 实际非零的已关账会话上，假「零电量关账」审计必须撤掉，不得留假证据。
+    """DELETE FROM session_events
+       WHERE action='零电量关账'
+         AND session_id IN (SELECT id FROM sessions
+                            WHERE status='已关账' AND COALESCE(kwh,0)>0.0005)""",
+    # 4) 清掉旁路写进 settings 的总览假计数与零电表面标记。
+    "DELETE FROM settings WHERE key='surface_last' OR key='surface_ok' "
+    "OR key LIKE 'zero_surface:%'",
 )
 
 
@@ -133,7 +151,7 @@ def _migrate(conn) -> None:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-    for stmt in BACKFILLS:
+    for stmt in REPAIRS:
         conn.execute(stmt)
 
 

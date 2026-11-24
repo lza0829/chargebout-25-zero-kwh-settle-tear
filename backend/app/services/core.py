@@ -1,6 +1,5 @@
 from __future__ import annotations
-from datetime import datetime, timedelta
-from app.services import zero_surface
+from datetime import datetime
 
 from app.db import db, row_dict, rows
 
@@ -233,10 +232,4 @@ def session_detail(conn, session_id: int):
     d["事件"] = events
     d["结算口径"] = zero_kwh_policy()
     return d
-
-_overview_impl = overview
-
-
-def overview(conn):
-    return zero_surface.overlay_overview(_overview_impl(conn), conn)
 

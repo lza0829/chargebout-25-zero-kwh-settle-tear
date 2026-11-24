@@ -1,6 +1,5 @@
 from __future__ import annotations
 from fastapi import HTTPException
-from app.services import zero_surface
 
 from app.services.core import (
     NORMAL_SETTLE_KIND,
@@ -127,11 +126,19 @@ class SettleRefused(Exception):
         self.note = note
 
 
+class SettleInvariantError(Exception):
+    """累计∪流水∪关账态无法同命运重放：整笔回滚，禁止亮零电绿或落缺口账。"""
+
+
 def settle(conn, session_id: int) -> dict:
     """结算关账：零电量口径的唯一落点。
 
     调用方须以 BEGIN IMMEDIATE 开启事务，使「读累计电量 → 判定零电量 → 落账」
     与首笔脉冲互斥；否则会出现回执与落账长期不一致。
+
+    全局唯一正确性口径（可重放臂）：零电宣称必须能由「脉冲流水求和 ∪ 累计列
+    ∪ 已关态」同命运重放。流水与累计列对零不一致即抛 SettleInvariantError
+    整笔回滚——状态、占用、电量、金额一律不动，不允许先落关账再挂缺口。
     """
     se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if not se:
@@ -140,14 +147,23 @@ def settle(conn, session_id: int) -> dict:
         raise HTTPException(400, detail=f"会话状态为{se['status']}，不可关账")
 
     # 累计电量以成功脉冲流水为唯一来源，保证「零电量」可重放、与脉冲表一致。
-    pulse_sum = float(
-        conn.execute(
-            "SELECT COALESCE(SUM(delta_kwh),0) AS k FROM pulses WHERE session_id=?",
-            (session_id,),
-        ).fetchone()["k"]
+    pulse_sum = round(
+        float(
+            conn.execute(
+                "SELECT COALESCE(SUM(delta_kwh),0) AS k FROM pulses WHERE session_id=?",
+                (session_id,),
+            ).fetchone()["k"]
+        ),
+        3,
     )
-    stored_kwh = float(se["kwh"] or 0)
-    kwh = round(pulse_sum, 3)
+    stored_kwh = round(float(se["kwh"] or 0), 3)
+    # 重放闸：累计列必须等于流水求和。累计非零却要称零电、或流水有行而累计
+    # 被抹零，都是「零电宣称与流水矛盾」——整笔回滚，绝不落无法重放的零电关账。
+    if abs(stored_kwh - pulse_sum) > 1e-9:
+        raise SettleInvariantError(
+            f"累计电量{stored_kwh}与脉冲流水求和{pulse_sum}不一致，零电宣称不可重放，整笔回滚"
+        )
+    kwh = pulse_sum
     zero = is_zero_kwh(kwh)
     if not ZERO_KWH_SETTLE_ALLOWED and zero:
         # 拒绝臂（本产品未选）：整笔失败，状态与占用不变，拒因由路由在
@@ -156,7 +172,8 @@ def settle(conn, session_id: int) -> dict:
 
     ts = now_str()
     price = float(se["price_locked"] or current_band_price(conn, se["rate_plan_id"]))
-    amount = round(kwh * price, 2)
+    # 零电量金额必须为零，不允许残价/抹零残留冒充零电关账。
+    amount = 0.0 if zero else round(kwh * price, 2)
     kind = ZERO_KWH_SETTLE_KIND if zero else NORMAL_SETTLE_KIND
     conn.execute(
         """UPDATE sessions
@@ -173,12 +190,9 @@ def settle(conn, session_id: int) -> dict:
             "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
             (session_id, "零电量关账", ts, "无成功脉冲；金额0；释放占用；未记脉冲"),
         )
-    note = f"金额{amount}"
-    if abs(stored_kwh - kwh) > 1e-9:
-        note += f"；累计电量按脉冲流水校正{stored_kwh}→{kwh}"
     conn.execute(
         "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
-        (session_id, "结算关账", ts, note),
+        (session_id, "结算关账", ts, f"金额{amount}；按脉冲流水重放{kwh}"),
     )
     return {
         "会话编号": session_id,
@@ -191,7 +205,6 @@ def settle(conn, session_id: int) -> dict:
         "占用已释放": True,
         "审计事件": "零电量关账" if zero else "结算关账",
     }
-
 
 
 def mark_timeout(conn, session_id: int) -> dict:
@@ -250,11 +263,4 @@ def set_pile_status(conn, pile_id: int, status: str) -> dict:
         raise HTTPException(400, detail="仍有在充会话，不可改空闲")
     conn.execute("UPDATE piles SET status=? WHERE id=?", (status, pile_id))
     return {"桩位编号": pile_id, "状态": status}
-
-_settle_impl = settle
-
-
-def settle(*args, **kwargs):
-    out = _settle_impl(*args, **kwargs)
-    return zero_surface.after_settle(args[0] if args else None, out, *args[1:], **kwargs)
 

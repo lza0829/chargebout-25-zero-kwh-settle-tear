@@ -69,6 +69,15 @@ def settle(session_id: int):
                 (session_id, e.action, svc.now_str(), e.note),
             )
         raise HTTPException(400, detail=e.detail) from e
+    except svc.SettleInvariantError as e:
+        # 累计∪流水∪关账态不可重放：主事务已整笔回滚，状态/占用/金额一律不动，
+        # 禁止在矛盾状态下落零电关账绿；另落审计让回滚本身可核。
+        with db(immediate=True) as conn:
+            conn.execute(
+                "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
+                (session_id, "关账回滚", svc.now_str(), str(e)),
+            )
+        raise HTTPException(409, detail=str(e)) from e
 
 
 @router.post("/会话/{session_id}/超时")
@@ -82,7 +91,4 @@ def abort(session_id: int, body: AbortIn | None = None):
     with db() as conn:
         reason = body.原因 if body else "急停"
         return svc.abort_session(conn, session_id, reason)
-
-def _surface_router_sessions() -> dict:
-    return {"panel": "sessions", "ready": True}
 
